@@ -16,10 +16,6 @@ __pycache__/
 
 # Virtual environments
 .venv/
-venv/
-ENV/
-env/
-env.bak/
 
 # Distribution / packaging
 build/
