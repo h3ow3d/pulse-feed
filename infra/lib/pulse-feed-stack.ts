@@ -13,6 +13,8 @@ import { StringParameter } from 'aws-cdk-lib/aws-ssm';
 import { Queue } from 'aws-cdk-lib/aws-sqs';
 import { CfnPipe } from 'aws-cdk-lib/aws-pipes';
 import { Role, ServicePrincipal, PolicyStatement } from 'aws-cdk-lib/aws-iam';
+import { Bucket, BlockPublicAccess } from 'aws-cdk-lib/aws-s3';
+import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 
 export class PulseFeedStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
@@ -69,7 +71,7 @@ export class PulseFeedStack extends Stack {
     const toFetch = new Queue(this, 'PulseFeedToFetch', {
       queueName: 'PulseFeedToFetch',
       deadLetterQueue: { queue: toFetchDlq, maxReceiveCount: 5 },
-      visibilityTimeout: Duration.seconds(60),
+      visibilityTimeout: Duration.seconds(120),
       retentionPeriod: Duration.days(4),
     });
 
@@ -106,6 +108,42 @@ export class PulseFeedStack extends Stack {
         sqsQueueParameters: {}, // standard queue
       },
     });
+
+    // S3 bucket to store fetched content
+    const rawBucket = new Bucket(this, 'PulseFeedRawContent', {
+      blockPublicAccess: BlockPublicAccess.BLOCK_ALL,
+      enforceSSL: true,
+      versioned: true,
+    });
+
+    // Fetcher Lambda (SQS ➜ fetch page ➜ write to S3)
+    const fetcher = new NodejsFunction(this, 'PulseFeedFetcher', {
+      functionName: 'PulseFeedFetcher',          // optional, nice for CLI
+      entry: path.join(__dirname, '../../src/fetcher/handler.ts'),
+      handler: 'handler',
+      runtime: Runtime.NODEJS_20_X,
+      memorySize: 512,
+      timeout: Duration.seconds(90),             // > SQS visibilityTimeout
+      tracing: Tracing.ACTIVE,
+      bundling: { minify: true, sourcesContent: false },
+      environment: {
+        RAW_BUCKET: rawBucket.bucketName,
+        MAX_BYTES: '4000000',                    // 4 MB safety cap
+      },
+    });
+
+    // allow writes to S3
+    rawBucket.grantWrite(fetcher);
+
+    // SQS → Lambda event source (make sure queue visibility > lambda timeout)
+    fetcher.addEventSource(new SqsEventSource(toFetch, {
+      batchSize: 5,
+      maxBatchingWindow: Duration.seconds(5),
+    }));
+
+    // Export bucket name for convenience
+    this.exportValue(rawBucket.bucketName, { name: 'PulseFeedRawContentBucketName' });
+
 
     // Outputs
     this.exportValue(posts.tableName, { name: 'PulseFeedPostsTableName' });
