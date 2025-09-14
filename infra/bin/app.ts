@@ -1,3 +1,4 @@
+// infra/bin/app.ts
 import { App } from 'aws-cdk-lib';
 import { PulseFeedStack } from '../lib/pulse-feed-stack';
 
