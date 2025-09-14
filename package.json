@@ -1,0 +1,40 @@
+{
+  "name": "pulse-feed",
+  "version": "0.1.0",
+  "type": "commonjs",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "cdk": "cdk",
+    "synth": "pnpm build && cdk synth",
+    "deploy": "pnpm build && cdk deploy --require-approval never",
+    "destroy": "cdk destroy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint . --ext .ts"
+  },
+  "devDependencies": {
+    "aws-cdk": "^2.154.0",
+    "@types/node": "^20.14.11",
+    "@typescript-eslint/eslint-plugin": "^7.13.1",
+    "@typescript-eslint/parser": "^7.13.1",
+    "eslint": "^8.57.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.2",
+    "vitest": "^2.0.5",
+    "aws-sdk-client-mock": "^3.1.0",
+    "nock": "^13.5.0",
+    "esbuild": "^0.23.1"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.154.0",
+    "constructs": "^10.3.0",
+    "@aws-sdk/client-dynamodb": "^3.645.0",
+    "@aws-sdk/lib-dynamodb": "^3.645.0",
+    "@aws-sdk/client-ssm": "^3.645.0",
+    "p-map": "^6.0.0",
+    "rss-parser": "^3.13.0",
+    "undici": "^6.19.8"
+  },
+  "packageManager": "pnpm@10.16.1"
+}

@@ -1,0 +1,4 @@
+{
+  "app": "ts-node infra/bin/app.ts",
+  "context": {}
+}
