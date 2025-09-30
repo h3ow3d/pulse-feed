@@ -1,35 +1,78 @@
 import * as path from 'path';
-import { Stack, StackProps, Duration, RemovalPolicy } from 'aws-cdk-lib';
+import {
+  Stack,
+  StackProps,
+  Duration,
+  RemovalPolicy,
+  CfnOutput,
+} from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 
-import { Table, AttributeType, BillingMode, StreamViewType } from 'aws-cdk-lib/aws-dynamodb';
-import { StringParameter } from 'aws-cdk-lib/aws-ssm';
-import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
+// DynamoDB
+import {
+  Table,
+  AttributeType,
+  BillingMode,
+  StreamViewType,
+} from 'aws-cdk-lib/aws-dynamodb';
+
+// Lambda
 import { Runtime, Tracing } from 'aws-cdk-lib/aws-lambda';
+import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
+import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
+
+// SSM Param
+import { StringParameter } from 'aws-cdk-lib/aws-ssm';
+
+// EventBridge (schedule)
 import { Rule, Schedule } from 'aws-cdk-lib/aws-events';
 import { LambdaFunction } from 'aws-cdk-lib/aws-events-targets';
-import { Queue, DeadLetterQueue } from 'aws-cdk-lib/aws-sqs';
-import { Role, ServicePrincipal, PolicyStatement } from 'aws-cdk-lib/aws-iam';
+
+// SQS
+import { Queue } from 'aws-cdk-lib/aws-sqs';
+
+// S3
+import {
+  Bucket,
+  BlockPublicAccess,
+  EventType as S3EventType,
+} from 'aws-cdk-lib/aws-s3';
+import { LambdaDestination } from 'aws-cdk-lib/aws-s3-notifications';
+
+// Pipes (DDB stream -> SQS)
 import { CfnPipe } from 'aws-cdk-lib/aws-pipes';
 
-import { Bucket, BlockPublicAccess, EventType } from 'aws-cdk-lib/aws-s3';
-import { SqsEventSource, S3EventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
+// IAM
+import { Role, ServicePrincipal, PolicyStatement } from 'aws-cdk-lib/aws-iam';
+
+// CloudWatch
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import { Metric } from 'aws-cdk-lib/aws-cloudwatch';
+import { LogGroup } from 'aws-cdk-lib/aws-logs';
 
 export class PulseFeedStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
 
-    // DynamoDB: posts (stream enabled)
+    // ---------------- DynamoDB: Posts (with Streams) ----------------
     const posts = new Table(this, 'PulseFeedPosts', {
       partitionKey: { name: 'feed_id', type: AttributeType.STRING },
       sortKey: { name: 'post_id', type: AttributeType.STRING },
       billingMode: BillingMode.PAY_PER_REQUEST,
-      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
       stream: StreamViewType.NEW_IMAGE,
-      removalPolicy: RemovalPolicy.DESTROY, // DEV ONLY - remove in prod
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      removalPolicy: RemovalPolicy.DESTROY, // DEV ONLY
     });
 
-    // SSM: feeds param
+    // ---------------- DynamoDB: Summaries ----------------
+    const summaries = new Table(this, 'PulseFeedSummaries', {
+      partitionKey: { name: 'post_id', type: AttributeType.STRING },
+      billingMode: BillingMode.PAY_PER_REQUEST,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      removalPolicy: RemovalPolicy.DESTROY, // DEV ONLY
+    });
+
+    // ---------------- SSM Parameter: Feeds list ----------------
     const feedsParam = new StringParameter(this, 'PulseFeedFeedsParam', {
       parameterName: '/pulse-feed/feeds',
       stringValue: JSON.stringify([
@@ -38,7 +81,24 @@ export class PulseFeedStack extends Stack {
       ]),
     });
 
-    // Lambda: ingest (EventBridge scheduled)
+    // ---------------- S3: Raw Content Bucket ----------------
+    const rawBucket = new Bucket(this, 'PulseFeedRawContent', {
+      blockPublicAccess: BlockPublicAccess.BLOCK_ALL,
+      autoDeleteObjects: true, // creates custom resource under the hood
+      removalPolicy: RemovalPolicy.DESTROY, // DEV ONLY
+    });
+
+    // ---------------- SQS: ToFetch + DLQ ----------------
+    const toFetchDlq = new Queue(this, 'PulseFeedToFetchDLQ', {});
+
+    const toFetch = new Queue(this, 'PulseFeedToFetch', {
+      // Visibility must be >= the Lambda timeout (60s). Give buffer.
+      visibilityTimeout: Duration.seconds(180),
+      deadLetterQueue: { queue: toFetchDlq, maxReceiveCount: 5 },
+    });
+
+
+    // ---------------- Lambda: Ingest (EventBridge schedule) ----------------
     const ingest = new NodejsFunction(this, 'PulseFeedIngest', {
       functionName: 'PulseFeedIngest',
       entry: path.join(__dirname, '../../src/ingest/handler.ts'),
@@ -53,95 +113,34 @@ export class PulseFeedStack extends Stack {
         FEEDS_PARAM: feedsParam.parameterName,
       },
     });
-    posts.grantReadWriteData(ingest);
+    posts.grantWriteData(ingest);
     feedsParam.grantRead(ingest);
 
-    new Rule(this, 'PulseFeedIngestSchedule', {
+    const ingestRule = new Rule(this, 'PulseFeedIngestSchedule', {
       schedule: Schedule.rate(Duration.minutes(15)),
       targets: [new LambdaFunction(ingest)],
     });
 
-    // SQS + DLQ for fetch pipeline
-    const toFetchDlq = new Queue(this, 'PulseFeedToFetchDLQ', {
-      retentionPeriod: Duration.days(14),
-    });
-    const toFetch = new Queue(this, 'PulseFeedToFetch', {
-      visibilityTimeout: Duration.seconds(120),
-      deadLetterQueue: { maxReceiveCount: 5, queue: toFetchDlq } as DeadLetterQueue,
-    });
-
-    // Pipes: DDB stream (INSERT) -> SQS
-    const pipeRole = new Role(this, 'PulseFeedPipeRole', {
-      assumedBy: new ServicePrincipal('pipes.amazonaws.com'),
-    });
-    pipeRole.addToPolicy(new PolicyStatement({
-      actions: ['dynamodb:DescribeStream', 'dynamodb:GetRecords', 'dynamodb:GetShardIterator', 'dynamodb:ListStreams'],
-      resources: ['*'], // scope to posts.tableStreamArn if you want to tighten
-    }));
-    pipeRole.addToPolicy(new PolicyStatement({
-      actions: ['sqs:SendMessage'],
-      resources: [toFetch.queueArn],
-    }));
-
-    new CfnPipe(this, 'PulseFeedDdbToSqsPipe', {
-      roleArn: pipeRole.roleArn,
-      source: posts.tableStreamArn!,
-      target: toFetch.queueArn,
-      sourceParameters: {
-        filterCriteria: {
-          filters: [{ pattern: '{"eventName":["INSERT"]}' }],
-        },
-        dynamoDbStreamParameters: {
-          startingPosition: 'LATEST',
-          batchSize: 10,
-        },
-      },
-      targetParameters: {
-        sqsQueueParameters: {},
-      },
-    });
-
-    // S3 bucket for raw content
-    const rawBucket = new Bucket(this, 'PulseFeedRawContent', {
-      blockPublicAccess: BlockPublicAccess.BLOCK_ALL,
-      enforceSSL: true,
-      versioned: true,
-      removalPolicy: RemovalPolicy.DESTROY, // DEV ONLY - remove in prod
-      autoDeleteObjects: true,              // DEV ONLY - remove in prod
-    });
-
-    // Lambda: fetcher (SQS -> fetch -> S3)
+    // ---------------- Lambda: Fetcher (SQS -> S3 text.txt) ----------------
     const fetcher = new NodejsFunction(this, 'PulseFeedFetcher', {
       functionName: 'PulseFeedFetcher',
       entry: path.join(__dirname, '../../src/fetcher/handler.ts'),
       handler: 'handler',
       runtime: Runtime.NODEJS_20_X,
       memorySize: 512,
-      timeout: Duration.seconds(90),
+      timeout: Duration.seconds(60),
       tracing: Tracing.ACTIVE,
       bundling: { minify: true, sourcesContent: false },
       environment: {
         RAW_BUCKET: rawBucket.bucketName,
-        MAX_BYTES: '4000000',
       },
     });
+    fetcher.addEventSource(new SqsEventSource(toFetch, { batchSize: 5 }));
     rawBucket.grantWrite(fetcher);
-    fetcher.addEventSource(new SqsEventSource(toFetch, {
-      batchSize: 5,
-      maxBatchingWindow: Duration.seconds(5),
-    }));
 
-    // DynamoDB: summaries table
-    const summaries = new Table(this, 'PulseFeedSummaries', {
-      partitionKey: { name: 'post_id', type: AttributeType.STRING },
-      billingMode: BillingMode.PAY_PER_REQUEST,
-      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
-      removalPolicy: RemovalPolicy.DESTROY, // DEV ONLY
-    });
-
-    // Lambda: summariser (UK spelling to match your deployed name)
-    const summariser = new NodejsFunction(this, 'PulseFeedSummariser', {
-      functionName: 'PulseFeedSummariser',
+    // ---------------- Lambda: Summariser (S3 text.txt -> Bedrock -> summary.json & DDB) ----------------
+    const summariser = new NodejsFunction(this, 'PulseFeedsummariser', {
+      functionName: 'PulseFeedsummariser',
       entry: path.join(__dirname, '../../src/summariser/handler.ts'),
       handler: 'handler',
       runtime: Runtime.NODEJS_20_X,
@@ -151,32 +150,315 @@ export class PulseFeedStack extends Stack {
       bundling: { minify: true, sourcesContent: false },
       environment: {
         RAW_BUCKET: rawBucket.bucketName,
-        SUMMARIES_TABLE: summaries.tableName,          // <-- make sure this line is present
+        SUMMARIES_TABLE: summaries.tableName, // ensure present
         BEDROCK_MODEL_ID: 'anthropic.claude-3-haiku-20240307-v1:0',
-        BEDROCK_REGION: 'eu-west-2',
+        BEDROCK_REGION: Stack.of(this).region,
         SUMMARY_CHAR_LIMIT: '280',
-        // SKIP_BEDROCK: 'true', // optional
+        // SKIP_BEDROCK: 'true', // optional fallback during dev
       },
     });
-
     rawBucket.grantRead(summariser);
-    rawBucket.grantWrite(summariser);
+    rawBucket.grantWrite(summariser); // allow summary.json
     summaries.grantWriteData(summariser);
-    summariser.addToRolePolicy(new PolicyStatement({
-      actions: ['bedrock:InvokeModel'],
-      resources: ['*'], // tighten to specific model ARN if desired
-    }));
 
-    // S3 -> summariser on text.txt created
-    summariser.addEventSource(new S3EventSource(rawBucket, {
-      events: [EventType.OBJECT_CREATED],
-      filters: [{ suffix: 'text.txt' }],
-    }));
+    // Bedrock invoke permission
+    summariser.addToRolePolicy(
+      new PolicyStatement({
+        actions: ['bedrock:InvokeModel'],
+        resources: ['*'], // scope down to specific model ARN if you prefer
+      }),
+    );
 
-    // Exports (handy in CLI)
-    this.exportValue(posts.tableName, { name: 'PulseFeedPostsTableName' });
-    this.exportValue(feedsParam.parameterName, { name: 'PulseFeedFeedsParamName' });
-    this.exportValue(rawBucket.bucketName, { name: 'PulseFeedRawContentBucketName' });
-    this.exportValue(summaries.tableName, { name: 'PulseFeedSummariesTableName' });
+    // S3 -> Lambda notification on *.text.txt
+    rawBucket.addEventNotification(
+      S3EventType.OBJECT_CREATED,
+      new LambdaDestination(summariser),
+      { suffix: 'text.txt' },
+    );
+
+    // ---------------- EventBridge Pipes: DDB stream -> SQS ----------------
+    const pipeRole = new Role(this, 'PulseFeedPipeRole', {
+      assumedBy: new ServicePrincipal('pipes.amazonaws.com'),
+    });
+    pipeRole.addToPolicy(
+      new PolicyStatement({
+        actions: [
+          'dynamodb:DescribeStream',
+          'dynamodb:GetRecords',
+          'dynamodb:GetShardIterator',
+          'dynamodb:ListStreams',
+        ],
+        resources: [posts.tableStreamArn!],
+      }),
+    );
+    pipeRole.addToPolicy(
+      new PolicyStatement({
+        actions: ['sqs:SendMessage'],
+        resources: [toFetch.queueArn],
+      }),
+    );
+
+    const PIPE_FIXED_NAME = 'PulseFeedDdbToSqsPipe';
+    const pipe = new CfnPipe(this, 'PulseFeedDdbToSqsPipe', {
+      name: PIPE_FIXED_NAME, // give it a stable name for metrics
+      roleArn: pipeRole.roleArn,
+      source: posts.tableStreamArn!,
+      target: toFetch.queueArn,
+      sourceParameters: {
+        filterCriteria: { filters: [{ pattern: '{"eventName":["INSERT"]}' }] },
+        dynamoDbStreamParameters: {
+          startingPosition: 'LATEST',
+          batchSize: 10,
+        },
+      },
+      targetParameters: { sqsQueueParameters: {} },
+    });
+
+    // ---------------- CloudWatch Dashboard ----------------
+    const dash = new cloudwatch.Dashboard(this, 'PulseFeedDashboard', {
+      dashboardName: 'PulseFeed',
+    });
+
+    // Title
+    dash.addWidgets(
+      new cloudwatch.TextWidget({
+        markdown: '# PulseFeed – Ops Overview',
+        width: 24,
+        height: 1,
+      }),
+    );
+
+    // Lambdas: Invocations & Errors
+    dash.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: 'Lambda: Invocations (L) & Errors (R)',
+        left: [
+          ingest.metricInvocations(),
+          fetcher.metricInvocations(),
+          summariser.metricInvocations(),
+        ],
+        right: [
+          ingest.metricErrors(),
+          fetcher.metricErrors(),
+          summariser.metricErrors(),
+        ],
+        width: 24,
+        height: 6,
+      }),
+    );
+
+    // Lambdas: p95 + Throttles
+    dash.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: 'Lambda p95 Duration (ms)',
+        left: [
+          ingest.metricDuration({ statistic: 'p95' }),
+          fetcher.metricDuration({ statistic: 'p95' }),
+          summariser.metricDuration({ statistic: 'p95' }),
+        ],
+        width: 12,
+        height: 6,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'Lambda Throttles',
+        left: [
+          ingest.metricThrottles(),
+          fetcher.metricThrottles(),
+          summariser.metricThrottles(),
+        ],
+        width: 12,
+        height: 6,
+      }),
+    );
+
+    // EventBridge rule metrics
+    dash.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: 'EventBridge: Ingest Rule',
+        left: [
+          new Metric({
+            namespace: 'AWS/Events',
+            metricName: 'Invocations',
+            dimensionsMap: { RuleName: ingestRule.ruleName },
+            statistic: 'Sum',
+            period: Duration.minutes(5),
+          }),
+        ],
+        right: [
+          new Metric({
+            namespace: 'AWS/Events',
+            metricName: 'FailedInvocations',
+            dimensionsMap: { RuleName: ingestRule.ruleName },
+            statistic: 'Sum',
+            period: Duration.minutes(5),
+          }),
+        ],
+        width: 24,
+        height: 6,
+      }),
+    );
+
+    // SQS queue metrics
+    dash.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: 'SQS ToFetch: Visible/NotVisible (L) & Age of Oldest (R)',
+        left: [
+          toFetch.metricApproximateNumberOfMessagesVisible(),
+          toFetch.metricApproximateNumberOfMessagesNotVisible(),
+        ],
+        right: [toFetch.metricApproximateAgeOfOldestMessage()],
+        width: 24,
+        height: 6,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'SQS DLQ: Visible',
+        left: [toFetchDlq.metricApproximateNumberOfMessagesVisible()],
+        width: 24,
+        height: 3,
+      }),
+    );
+
+    // DDB metrics
+    dash.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: 'DDB: Posts – RCU/WCU & Throttles',
+        left: [
+          posts.metricConsumedReadCapacityUnits(),
+          posts.metricConsumedWriteCapacityUnits(),
+        ],
+        right: [posts.metricThrottledRequests()],
+        width: 12,
+        height: 6,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'DDB: Summaries – RCU/WCU & Throttles',
+        left: [
+          summaries.metricConsumedReadCapacityUnits(),
+          summaries.metricConsumedWriteCapacityUnits(),
+        ],
+        right: [summaries.metricThrottledRequests()],
+        width: 12,
+        height: 6,
+      }),
+    );
+
+    // S3 storage metrics (daily refresh) — use explicit Metric
+    dash.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: 'S3 RawContent – Objects & Size (daily metrics)',
+        left: [
+          new Metric({
+            namespace: 'AWS/S3',
+            metricName: 'NumberOfObjects',
+            dimensionsMap: {
+              BucketName: rawBucket.bucketName,
+              StorageType: 'AllStorageTypes',
+            },
+            statistic: 'Average',
+            period: Duration.hours(6),
+          }),
+        ],
+        right: [
+          new Metric({
+            namespace: 'AWS/S3',
+            metricName: 'BucketSizeBytes',
+            dimensionsMap: {
+              BucketName: rawBucket.bucketName,
+              StorageType: 'StandardStorage',
+            },
+            statistic: 'Average',
+            period: Duration.hours(6),
+          }),
+        ],
+        width: 24,
+        height: 6,
+      }),
+    );
+
+    // Pipes metrics — reference the fixed name we set on the pipe
+    dash.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: 'EventBridge Pipes: Incoming / Outgoing / Filtered',
+        left: [
+          new Metric({
+            namespace: 'AWS/Pipes',
+            metricName: 'IncomingRecords',
+            dimensionsMap: { PipeName: PIPE_FIXED_NAME },
+            statistic: 'Sum',
+          }),
+          new Metric({
+            namespace: 'AWS/Pipes',
+            metricName: 'OutgoingRecords',
+            dimensionsMap: { PipeName: PIPE_FIXED_NAME },
+            statistic: 'Sum',
+          }),
+          new Metric({
+            namespace: 'AWS/Pipes',
+            metricName: 'FilteredRecords',
+            dimensionsMap: { PipeName: PIPE_FIXED_NAME },
+            statistic: 'Sum',
+          }),
+        ],
+        width: 24,
+        height: 6,
+      }),
+    );
+
+    // Logs Insights widget: recent errors
+    const ingestLG = LogGroup.fromLogGroupName(
+      this,
+      'LGIngest',
+      `/aws/lambda/${ingest.functionName}`,
+    );
+    const fetcherLG = LogGroup.fromLogGroupName(
+      this,
+      'LGFetcher',
+      `/aws/lambda/${fetcher.functionName}`,
+    );
+    const summariserLG = LogGroup.fromLogGroupName(
+      this,
+      'LGSummariser',
+      `/aws/lambda/${summariser.functionName}`,
+    );
+
+    dash.addWidgets(
+      new cloudwatch.LogQueryWidget({
+        title: 'Recent Lambda Errors (last 1h)',
+        logGroupNames: [
+          ingestLG.logGroupName,
+          fetcherLG.logGroupName,
+          summariserLG.logGroupName,
+        ],
+        queryLines: [
+          'fields @timestamp, @log, @message',
+          'filter @message like /ERROR|ValidationException|AccessDenied|Throttles|Task timed out/',
+          'sort @timestamp desc',
+          'limit 50',
+        ],
+        width: 24,
+        height: 6,
+      }),
+    );
+
+    // ---------------- Exports ----------------
+    new CfnOutput(this, 'ExportPulseFeedPostsTableName', {
+      value: posts.tableName,
+      exportName: 'PulseFeedPostsTableName',
+    });
+
+    new CfnOutput(this, 'ExportPulseFeedSummariesTableName', {
+      value: summaries.tableName,
+      exportName: 'PulseFeedSummariesTableName',
+    });
+
+    new CfnOutput(this, 'ExportPulseFeedRawContentBucketName', {
+      value: rawBucket.bucketName,
+      exportName: 'PulseFeedRawContentBucketName',
+    });
+
+    new CfnOutput(this, 'ExportPulseFeedFeedsParamName', {
+      value: feedsParam.parameterName,
+      exportName: 'PulseFeedFeedsParamName',
+    });
   }
 }

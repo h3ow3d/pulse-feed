@@ -1,8 +1,13 @@
-// infra/bin/app.ts
+#!/usr/bin/env node
+import 'source-map-support/register';
 import { App } from 'aws-cdk-lib';
 import { PulseFeedStack } from '../lib/pulse-feed-stack';
 
 const app = new App();
+
 new PulseFeedStack(app, 'PulseFeedStack', {
-  env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: process.env.CDK_DEFAULT_REGION },
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'eu-west-2',
+  },
 });
