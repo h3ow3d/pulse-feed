@@ -1,45 +1,44 @@
-// infra/lib/pulse-feed-stack.ts
-import * as path from 'node:path';
+import * as path from 'path';
 import { Stack, StackProps, Duration, RemovalPolicy } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
-import {
-  Table, AttributeType, BillingMode, StreamViewType
-} from 'aws-cdk-lib/aws-dynamodb';
+
+import { Table, AttributeType, BillingMode, StreamViewType } from 'aws-cdk-lib/aws-dynamodb';
+import { StringParameter } from 'aws-cdk-lib/aws-ssm';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import { Runtime, Tracing } from 'aws-cdk-lib/aws-lambda';
 import { Rule, Schedule } from 'aws-cdk-lib/aws-events';
 import { LambdaFunction } from 'aws-cdk-lib/aws-events-targets';
-import { StringParameter } from 'aws-cdk-lib/aws-ssm';
-import { Queue } from 'aws-cdk-lib/aws-sqs';
-import { CfnPipe } from 'aws-cdk-lib/aws-pipes';
+import { Queue, DeadLetterQueue } from 'aws-cdk-lib/aws-sqs';
 import { Role, ServicePrincipal, PolicyStatement } from 'aws-cdk-lib/aws-iam';
-import { Bucket, BlockPublicAccess } from 'aws-cdk-lib/aws-s3';
-import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
+import { CfnPipe } from 'aws-cdk-lib/aws-pipes';
+
+import { Bucket, BlockPublicAccess, EventType } from 'aws-cdk-lib/aws-s3';
+import { SqsEventSource, S3EventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 
 export class PulseFeedStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
 
-    // DynamoDB: posts table (Streams enabled)
+    // DynamoDB: posts (stream enabled)
     const posts = new Table(this, 'PulseFeedPosts', {
       partitionKey: { name: 'feed_id', type: AttributeType.STRING },
-      sortKey:      { name: 'post_id', type: AttributeType.STRING },
+      sortKey: { name: 'post_id', type: AttributeType.STRING },
       billingMode: BillingMode.PAY_PER_REQUEST,
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
-      stream: StreamViewType.NEW_IMAGE,                // <-- enable streams
-      removalPolicy: RemovalPolicy.DESTROY,            // DEV ONLY
+      stream: StreamViewType.NEW_IMAGE,
+      removalPolicy: RemovalPolicy.DESTROY, // DEV ONLY - remove in prod
     });
 
-    // SSM parameter for feed list
+    // SSM: feeds param
     const feedsParam = new StringParameter(this, 'PulseFeedFeedsParam', {
       parameterName: '/pulse-feed/feeds',
       stringValue: JSON.stringify([
         'https://aws.amazon.com/blogs/aws/feed/',
-        'https://news.ycombinator.com/rss'
+        'https://news.ycombinator.com/rss',
       ]),
     });
 
-    // Ingest Lambda
+    // Lambda: ingest (EventBridge scheduled)
     const ingest = new NodejsFunction(this, 'PulseFeedIngest', {
       functionName: 'PulseFeedIngest',
       entry: path.join(__dirname, '../../src/ingest/handler.ts'),
@@ -54,101 +53,130 @@ export class PulseFeedStack extends Stack {
         FEEDS_PARAM: feedsParam.parameterName,
       },
     });
-
-    posts.grantWriteData(ingest);
+    posts.grantReadWriteData(ingest);
     feedsParam.grantRead(ingest);
 
-    // Schedule every 15 minutes
     new Rule(this, 'PulseFeedIngestSchedule', {
       schedule: Schedule.rate(Duration.minutes(15)),
       targets: [new LambdaFunction(ingest)],
     });
 
-    // ---- Phase 3: CDC fan-out (Streams -> Pipe -> SQS) ----
-
-    // SQS + DLQ
-    const toFetchDlq = new Queue(this, 'PulseFeedToFetchDLQ', {});
+    // SQS + DLQ for fetch pipeline
+    const toFetchDlq = new Queue(this, 'PulseFeedToFetchDLQ', {
+      retentionPeriod: Duration.days(14),
+    });
     const toFetch = new Queue(this, 'PulseFeedToFetch', {
-      queueName: 'PulseFeedToFetch',
-      deadLetterQueue: { queue: toFetchDlq, maxReceiveCount: 5 },
       visibilityTimeout: Duration.seconds(120),
-      retentionPeriod: Duration.days(4),
+      deadLetterQueue: { maxReceiveCount: 5, queue: toFetchDlq } as DeadLetterQueue,
     });
 
-    // Pipes service role
+    // Pipes: DDB stream (INSERT) -> SQS
     const pipeRole = new Role(this, 'PulseFeedPipeRole', {
       assumedBy: new ServicePrincipal('pipes.amazonaws.com'),
     });
-    // DDB stream read permissions (you can scope to posts.tableStreamArn)
     pipeRole.addToPolicy(new PolicyStatement({
-      actions: ['dynamodb:DescribeStream','dynamodb:GetRecords','dynamodb:GetShardIterator','dynamodb:ListStreams'],
-      resources: [posts.tableStreamArn!],
+      actions: ['dynamodb:DescribeStream', 'dynamodb:GetRecords', 'dynamodb:GetShardIterator', 'dynamodb:ListStreams'],
+      resources: ['*'], // scope to posts.tableStreamArn if you want to tighten
     }));
-    // SQS send permission
     pipeRole.addToPolicy(new PolicyStatement({
       actions: ['sqs:SendMessage'],
       resources: [toFetch.queueArn],
     }));
 
-    // EventBridge Pipe: DDB Stream -> SQS (INSERT only)
     new CfnPipe(this, 'PulseFeedDdbToSqsPipe', {
       roleArn: pipeRole.roleArn,
       source: posts.tableStreamArn!,
+      target: toFetch.queueArn,
       sourceParameters: {
+        filterCriteria: {
+          filters: [{ pattern: '{"eventName":["INSERT"]}' }],
+        },
         dynamoDbStreamParameters: {
           startingPosition: 'LATEST',
-          // batchSize: 10, // optional
-        },
-        filterCriteria: {
-          filters: [{ pattern: JSON.stringify({ eventName: ['INSERT'] }) }],
+          batchSize: 10,
         },
       },
-      target: toFetch.queueArn,
       targetParameters: {
-        sqsQueueParameters: {}, // standard queue
+        sqsQueueParameters: {},
       },
     });
 
-    // S3 bucket to store fetched content
+    // S3 bucket for raw content
     const rawBucket = new Bucket(this, 'PulseFeedRawContent', {
       blockPublicAccess: BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true,
       versioned: true,
+      removalPolicy: RemovalPolicy.DESTROY, // DEV ONLY - remove in prod
+      autoDeleteObjects: true,              // DEV ONLY - remove in prod
     });
 
-    // Fetcher Lambda (SQS ➜ fetch page ➜ write to S3)
+    // Lambda: fetcher (SQS -> fetch -> S3)
     const fetcher = new NodejsFunction(this, 'PulseFeedFetcher', {
-      functionName: 'PulseFeedFetcher',          // optional, nice for CLI
+      functionName: 'PulseFeedFetcher',
       entry: path.join(__dirname, '../../src/fetcher/handler.ts'),
       handler: 'handler',
       runtime: Runtime.NODEJS_20_X,
       memorySize: 512,
-      timeout: Duration.seconds(90),             // > SQS visibilityTimeout
+      timeout: Duration.seconds(90),
       tracing: Tracing.ACTIVE,
       bundling: { minify: true, sourcesContent: false },
       environment: {
         RAW_BUCKET: rawBucket.bucketName,
-        MAX_BYTES: '4000000',                    // 4 MB safety cap
+        MAX_BYTES: '4000000',
       },
     });
-
-    // allow writes to S3
     rawBucket.grantWrite(fetcher);
-
-    // SQS → Lambda event source (make sure queue visibility > lambda timeout)
     fetcher.addEventSource(new SqsEventSource(toFetch, {
       batchSize: 5,
       maxBatchingWindow: Duration.seconds(5),
     }));
 
-    // Export bucket name for convenience
-    this.exportValue(rawBucket.bucketName, { name: 'PulseFeedRawContentBucketName' });
+    // DynamoDB: summaries table
+    const summaries = new Table(this, 'PulseFeedSummaries', {
+      partitionKey: { name: 'post_id', type: AttributeType.STRING },
+      billingMode: BillingMode.PAY_PER_REQUEST,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      removalPolicy: RemovalPolicy.DESTROY, // DEV ONLY
+    });
 
+    // Lambda: summariser (UK spelling to match your deployed name)
+    const summariser = new NodejsFunction(this, 'PulseFeedSummariser', {
+      functionName: 'PulseFeedSummariser',
+      entry: path.join(__dirname, '../../src/summariser/handler.ts'),
+      handler: 'handler',
+      runtime: Runtime.NODEJS_20_X,
+      memorySize: 1024,
+      timeout: Duration.seconds(60),
+      tracing: Tracing.ACTIVE,
+      bundling: { minify: true, sourcesContent: false },
+      environment: {
+        RAW_BUCKET: rawBucket.bucketName,
+        SUMMARIES_TABLE: summaries.tableName,          // <-- make sure this line is present
+        BEDROCK_MODEL_ID: 'anthropic.claude-3-haiku-20240307-v1:0',
+        BEDROCK_REGION: 'eu-west-2',
+        SUMMARY_CHAR_LIMIT: '280',
+        // SKIP_BEDROCK: 'true', // optional
+      },
+    });
 
-    // Outputs
+    rawBucket.grantRead(summariser);
+    rawBucket.grantWrite(summariser);
+    summaries.grantWriteData(summariser);
+    summariser.addToRolePolicy(new PolicyStatement({
+      actions: ['bedrock:InvokeModel'],
+      resources: ['*'], // tighten to specific model ARN if desired
+    }));
+
+    // S3 -> summariser on text.txt created
+    summariser.addEventSource(new S3EventSource(rawBucket, {
+      events: [EventType.OBJECT_CREATED],
+      filters: [{ suffix: 'text.txt' }],
+    }));
+
+    // Exports (handy in CLI)
     this.exportValue(posts.tableName, { name: 'PulseFeedPostsTableName' });
     this.exportValue(feedsParam.parameterName, { name: 'PulseFeedFeedsParamName' });
-    this.exportValue(toFetch.queueName, { name: 'PulseFeedToFetchName' });
-    this.exportValue(toFetch.queueUrl,   { name: 'PulseFeedToFetchUrl' });
+    this.exportValue(rawBucket.bucketName, { name: 'PulseFeedRawContentBucketName' });
+    this.exportValue(summaries.tableName, { name: 'PulseFeedSummariesTableName' });
   }
 }
